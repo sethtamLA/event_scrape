@@ -76,11 +76,20 @@ MASKED names** — `"Txxx Rxxxxxxxxx"` (first letter kept, rest replaced with `x
 Statuses, counts, RSVP dates and messages come back real; only `name` is
 blanked. This looks like a successful scrape and is not.
 
-Detect it: if the names look like a letter followed by `x`s, you are
-unauthenticated. Do not build a sheet from masked names.
+Detect it: if the names look like a letter followed by `x`s, you are not an
+authorized viewer. Do not build a sheet from masked names.
 
-So authentication is required for real names, even on a `public` event with
-`showGuestList: true`.
+**Masking is per-event authorization, not just auth state.** A valid token is
+necessary but not sufficient: Partiful unmasks names only to guests and hosts
+of *that* event. Observed on one token in the same minute — a GenJam event
+returned real names while `AI, FILM & THE NEW ECONOMICS of CREATIVITY` returned
+`Pxxxxxx Hxxxxxx` for all 89 records, because the user had merely browsed that
+page and never RSVP'd. `getEventInfo` still reports `visibility: public` and
+`showGuestList: true`, so those fields do not predict it.
+
+Consequence: when the masked guard fires, the fix is for the user to RSVP to
+that event (or be invited) — not to re-harvest the token. Check that first
+before spending a cycle on Chrome's leveldb.
 
 ## Auth: the Firebase token
 
@@ -235,14 +244,35 @@ instead of driving `web_search` one name at a time:
 ```bash
 S="$LOCALAPPDATA/hermes/skills/research/partiful-guest-list/scripts/partiful_pipeline.py"
 python "$S" --event https://partiful.com/e/<ID> \
-    --out "$HOME/Desktop/<Event> Guest List - LinkedIn.xlsx" \
-    --raw-out "$HOME/raw_<ID>.json"
+    --out "C:/Users/<user>/Desktop/<Event> Guest List - LinkedIn.xlsx" \
+    --raw-out "C:/Users/<user>/raw_<ID>.json" \
+    --append-master --strict-identity
 ```
+
+`--append-master` adds a tab to the Oxen-Forecast Google Sheet (the user's
+standard deliverable). `--strict-identity` blanks URLs where the LinkedIn
+profile title has no surname evidence — safer than shipping mismatches.
+Always use both for new events going into the master sheet.
+
+On Windows, use `C:/Users/...` forward-slash paths — MSYS `$HOME` expands to
+`/c/Users/...` which native Windows programs (openpyxl's ZipFile, Python's
+`open()`) cannot open. The same applies to `--raw-out` and `--out`.
 
 It refreshes the token, fetches `getEventInfo` + `getGuests`, hard-fails on
 masked names, filters to first+last, enriches via Exa (default 8 workers), builds
-the workbook, and **audits that every URL cell is backed by a literal `/in/`
-hit** before writing. Measured: ~9s for 82 names, ~41s for 190, ~102s for 459 —
+the workbook, and runs **two audits before writing**:
+
+- **provenance** — every URL cell is backed by a literal `/in/` hit (hard fail)
+- **identity** — every matched profile's own *title* carries the person's name
+  tokens; failures print and are downgraded to Low with a `NAME CHECK:` note
+
+Provenance alone is not enough. On one 63-name event provenance passed 62/62
+while identity flagged 9, of which 5 were a different human entirely
+(`Adem Betta` -> `/in/allen-adem-5851708` "ALLEN ADEM", `alex vicars` ->
+`/in/alan-prile-40787199` "Alan Prile", `Grace Tabib` -> `/in/joypereira`,
+`Momentum Impact` -> `/in/chikos`, plus a couple the name filter missed). The
+other flags were genuine variants (`Jen Essa` -> "Jennifer Essa", `Tatiana
+Arefyeva` -> "Tatiana Arefieva") — surface those, do not drop them. Measured: ~9s for 82 names, ~41s for 190, ~102s for 459 —
 where the manual path took ~20 minutes at 459.
 
 Flags: `--union-raw <prev-raw.json>` (merge an earlier pull to get past the 500
@@ -264,6 +294,23 @@ Two guards worth knowing:
 
 openpyxl is imported lazily inside the workbook functions, so the scrape half
 can be imported by another script on an interpreter without openpyxl.
+The Hermes venv does not ship openpyxl; install it before the first pipeline
+run: `uv pip install --python "$VENV_PY" openpyxl`.
+
+**Embedding API (GUI / cron / tests):** the script is importable —
+`partiful_pipeline.run_pipeline(args_namespace)` runs one event end to end,
+raises `PipelineError` (never `sys.exit`) on failure, and returns a dict
+{rows, dropped, ev, eid, store, raw_path, blanked, flagged, sheet_url,
+master_url, target_url, out}. Live output goes to stdout AND the module-global
+`LOG_FN`; enrichment ticks go to `PROGRESS(done, total)` — set both before
+calling. `--append-sheet <sheet_id_or_url>` appends rows into a
+user-specified Google Sheet as ONE consolidated tab (schema:
+Event Name | Event URL | Guest Name | LinkedIn Profile | Company/Headline |
+Timestamp; tab created on first use, created via `--append-tab`, default the
+event title) — distinct from `--append-master` (Oxen-Forecast tab per event) —
+and returns its `#gid` URL as `target_url`. `--append-master` is unchanged.
+The `enrich()` thread-pool bug (only the first name was enriched, early return
+inside the loop) is fixed.
 
 **Manual path**, if the pipeline breaks — `partiful_guests.py` for the scrape,
 then `contact-list-enrichment`'s `build_guest_workbook.py` for the workbook:
@@ -311,6 +358,23 @@ Manual fallback (if the script breaks): `getEventInfo` to confirm the event,
 
 - **Masked names are the #1 trap.** A 200 with 500 records looks like success.
   Always assert the names are not `x`-masked before proceeding.
+- **The couple/duo filter must be case-insensitive.** `re.search(r"\s*(?:&|\band\b)\s*", n)`
+  without `re.I` misses `Kenz And Chris` (capital A) and ships a two-person row
+  as one lead. Fixed in `partiful_pipeline.py`; check any re-implementation.
+- **The company denylist does not catch every brand.** `Momentum Impact` passes
+  the keyword list (`inc|llc|labs|studio|ventures|...`) and matched a real
+  person's profile. The identity audit is what surfaces it — another reason that
+  check is mandatory rather than optional.
+- **Surname evidence is the identity rule; the given name is not.** A title
+  containing only the given name is a different person (`Adem Betta` vs `ALLEN
+  ADEM`). Require the surname — exact, accent-folded, a hyphenated part, or a
+  near-variant on tokens of 6+ characters — or the surname inside the profile
+  slug. Two rules that look right and are not: fuzzy-matching short surnames
+  re-admits `Seth Tam` -> `Seth Tams` (ratio 0.857), and title-only evidence
+  wrongly blanks real matches whose profile title is abbreviated or accented
+  (`Nour H.` for `/in/nourhassoun`, `radim vysoký` for `Radim Vysoky`).
+  `--strict-identity` implements this; run it, and expect a handful of
+  `NAME CHECK:` rows to survive for review (nicknames, hyphenated surnames).
 - **`classify_loc` must check LA_CORE before NON_LA.** A LinkedIn profile that
   mentions both "Los Angeles" and "Irvine" must return Yes (LA-area), not No.
   Checking NON_LA first inverts the result for any profile spanning both regions.
@@ -345,6 +409,9 @@ sample of a larger list, not a prefix of it. Consequence: a single pull always
 under-counts, and **unioning pulls taken at different times is the only way to
 recover more of the list**. Do that when the count is exactly 500, and report
 the union size rather than presenting one pull as the guest list.
+  **Same-session re-pulls return 0 new names.** Two pulls within minutes share
+  the exact same 500-record window. Wait hours (or overnight) before trying again
+  so the sample rotates; don't re-run immediately and waste an enrichment cycle.
 - **The profile copy does NOT carry the Firebase token.** IndexedDB comes over
   empty; don't waste a cycle on `browser.use_real_profile` for Partiful. Read
   the leveldb directly (see Auth).
@@ -359,6 +426,147 @@ the union size rather than presenting one pull as the guest list.
   status column in the deliverable rather than assuming it is uniform.
 - **Refresh tokens can be revoked** (user logs out everywhere). When calls
   start 401ing, re-harvest the token.
+- **On Windows, file-path arguments must use `C:/Users/...` format, not MSYS
+  Unix paths.** `$HOME/Desktop/file.xlsx` expands to `/c/Users/...` in MSYS
+  bash, which native Windows programs (openpyxl, Python's stdlib) cannot open.
+  `--out` and `--raw-out` both hit this — `FileNotFoundError` from `ZipFile`
+  or `open()`. Use `C:/Users/<user>/Desktop/...` instead.
+
+## Adding LinkedIn Bio Snippets (Post-Enrichment)
+
+After a sheet is built or updated, the user may ask for a "Bio" column with a
+snippet from each person's LinkedIn About section. Fetch these via Exa's
+`/contents` endpoint — do NOT drive `web_extract` one URL at a time (165 URLs
+× 5 per call = ~33 round-trips and minutes of overhead).
+
+**0. Find the exact tab name.** The pipeline prints a gid URL but not the tab
+name. The tab name can have subtle variations (double spaces, truncated
+characters) that break `values().get()` with a 400. Use `spreadsheets().get()`
+to list all tabs and grep for the event name before any post-enrichment work:
+
+```python
+sheet = service.spreadsheets().get(spreadsheetId=SHEET_ID).execute()
+for s in sheet['sheets']:
+    p = s['properties']
+    if '<keyword from event title>' in p['title']:
+        print(repr(p['title']))  # use repr() — reveals double spaces
+```
+
+**1. Count rows and read URLs.** Read column A to get the row count, then
+columns A:F for the URL mapping:
+
+```python
+result = service.spreadsheets().values().get(
+    spreadsheetId=SHEET_ID, range=f"'{TAB}'!A:A").execute()
+total_data_rows = len(result.get('values', [])) - 1  # minus header
+
+result = service.spreadsheets().values().get(
+    spreadsheetId=SHEET_ID, range=f"'{TAB}'!A:F").execute()
+rows = result.get('values', [])
+url_map = {}
+for i, row in enumerate(rows[1:], 0):
+    if len(row) > 1 and row[1].startswith('https://linkedin.com/in/'):
+        url_map[i] = row[1]
+```
+
+**2. Call Exa `/contents` in batches of 20.** Auth is `x-api-key` only (no
+`Authorization` header — using both returns 402).
+
+```python
+body = json.dumps({"urls": batch, "text": {"max_characters": 800}}).encode()
+req = urllib.request.Request("https://api.exa.ai/contents", data=body,
+    headers={"Content-Type": "application/json", "x-api-key": exa_key})
+```
+
+**3. Extract the About section** from each result's text:
+
+```python
+about_match = re.search(r'## About\s*\n+(.*?)(?=\n##|\Z)', text, re.DOTALL)
+if about_match:
+    about = about_match.group(1).strip()
+    if len(about) > 200:
+        about = about[:197] + '...'
+    bios[url] = about
+```
+
+**4. Write all bios in one `values.update` call.** Add a "Bio" header at row 1,
+then write the full column from row 2 down in a single range — avoid individual
+cell writes or batch HTTP requests; one call finishes it. Use the row count from
+step 1 to build the full column array:
+
+```python
+service.spreadsheets().values().update(
+    spreadsheetId=SHEET_ID, range=f"'{TAB}'!G1",
+    valueInputOption="RAW", body={"values": [["Bio"]]}).execute()
+
+bio_values = []
+for data_row_idx in range(total_data_rows):
+    url = url_map.get(data_row_idx)
+    bio_values.append([bios.get(url, "") if url else ""])
+
+service.spreadsheets().values().update(
+    spreadsheetId=SHEET_ID, range=f"'{TAB}'!G2",
+    valueInputOption="RAW", body={"values": bio_values}).execute()
+```
+
+Expect ~95% coverage (158/165 in practice); the rest are profiles Exa couldn't
+reach or rows without a LinkedIn URL.
+
+**5. Clean the bio text.** Exa returns full profile text including a trailing
+"Total Experience: X years" line — strip it and any trailing newlines:
+
+```python
+bio = re.sub(r'\n+Total Experience:.*$', '', bio, flags=re.DOTALL).strip()
+```
+
+Also clean the Notes column — strip the "N candidates; " prefix the pipeline
+leaves as provenance metadata:
+
+```python
+note = re.sub(r'^\d+ candidates?;\s*', '', note)
+```
+
+Write both cleaned columns back with `values.update` before formatting.
+
+## Location Column Shortening (Post-Enrichment)
+
+The pipeline outputs verbose location strings like "Los Angeles, California,
+United States" and "Santa Monica, California, United States". Shorten them
+before final review — the user wants "Los Angeles, CA", not the full form.
+
+```python
+def shorten_loc(loc):
+    if not loc:
+        return loc
+    loc = re.sub(r',?\s*United States\s*$', '', loc)
+    loc = re.sub(r',\s*California', ', CA', loc)
+    loc = re.sub(r',\s*,', ',', loc)
+    return loc.strip().rstrip(',')
+```
+
+Read the full sheet back, apply to column C, and `values.update` the whole
+range back in one call. Run this after bios are added and cleaned, before
+formatting.
+
+## Sheet Formatting (Post-Enrichment)
+
+After all data is in and cleaned, apply professional formatting to every event tab:
+
+- **Header row:** dark blue (#1F385B) background, white bold 10pt text, frozen
+- **Data rows:** 10pt font, top-aligned, wrap only on Notes and Bio columns
+- **Column widths:** Name 160px, LinkedIn 280px, Location 200px, LA Area 70px,
+  Confidence 85px, Notes 180px, Bio 350px
+- **Borders:** subtle grey horizontal lines between rows (no vertical borders)
+- **Filters:** on every column
+- **No alternating row colors** — the user prefers clean, tight, minimal styling
+
+Apply via `batchUpdate` with `repeatCell`, `updateDimensionProperties`,
+`setBasicFilter`, and `updateBorders` requests. Use `spreadsheets().get()` to
+enumerate all tabs and skip non-event tabs (Leads, Vendors, Communities, and
+any tab whose first column header is not "Name").
+
+Before formatting, delete any stale duplicate tabs (tabs ending in " (2)" etc.)
+with `deleteSheet`.
 
 ## Verification
 
