@@ -22,6 +22,7 @@ Exit code is non-zero on any failure, so a cron job can alert on it.
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
 import re
@@ -29,6 +30,8 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+import unicodedata
+from datetime import datetime
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
@@ -46,9 +49,29 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36")
 
 
+class PipelineError(Exception):
+    """Raised instead of sys.exit so embedders (GUI, cron) can catch failures."""
+
+    def __init__(self, msg, code=1):
+        super().__init__(msg)
+        self.code = code
+
+
 def die(msg, code=1):
-    print(f"ERROR: {msg}", file=sys.stderr)
-    sys.exit(code)
+    raise PipelineError(msg, code)
+
+
+# Embedding hooks: a GUI or scheduler sets LOG_FN (and optionally PROGRESS)
+# to receive every status line / enrichment tick in addition to stdout.
+LOG_FN = None
+PROGRESS = None
+
+
+def log(*args):
+    msg = " ".join(str(a) for a in args)
+    print(msg)
+    if LOG_FN:
+        LOG_FN(msg)
 
 
 # ---------------------------------------------------------------- Partiful
@@ -116,7 +139,7 @@ def classify(guests):
             dropped.append([raw, "no name after cleanup"]); continue
         if COMPANY.search(n):
             dropped.append([raw, "company/brand-like"]); continue
-        if re.search(r"\s*(?:&|\band\b)\s*", n):
+        if re.search(r"\s*(?:&|\band\b)\s*", n, re.I):
             dropped.append([raw, "multiple people (couple/duo)"]); continue
         toks = n.split()
         # only a *surname* initial disqualifies; a middle initial is fine
@@ -173,7 +196,7 @@ def norm_hits(results):
     return out
 
 
-def enrich(key, names, workers, city):
+def enrich(key, names, workers, city, on_progress=None):
     store, t0 = {}, time.time()
 
     def one(n):
@@ -188,7 +211,11 @@ def enrich(key, names, workers, city):
             store[n] = hits
             done += 1
             if done % 25 == 0:
-                print(f"    searched {done}/{len(names)}  ({time.time()-t0:.0f}s)")
+                log(f"    searched {done}/{len(names)}  ({time.time()-t0:.0f}s)")
+            if on_progress:
+                on_progress(done, len(names))
+            if PROGRESS:
+                PROGRESS(done, len(names))
     return store, time.time() - t0
 
 
@@ -292,6 +319,95 @@ def slug_from(url):
     return (m.group(1), True) if m else (None, False)
 
 
+def name_tokens(s):
+    """Lowercase word tokens of a name or profile title (hyphens kept)."""
+    return {t for t in re.split(r"[^A-Za-z\u00c0-\u024f'\-]+", (s or "").lower()) if t}
+
+
+def title_matches(title, name):
+    """True when every meaningful token of `name` appears as a token of the
+    profile's OWN title.
+
+    Token boundaries matter, not substrings: a plain `in` test lets `Seth Tam`
+    match the title `Seth Tams`, which is a different person one character away.
+    """
+    want = [t for t in name_tokens(name) if len(t) > 1]
+    have = name_tokens(title)
+    return all(t in have for t in want)
+
+
+def ordered_tokens(s):
+    """Lowercase word tokens, in order (hyphens kept)."""
+    return [t for t in re.split(r"[^A-Za-z\u00c0-\u024f'\-]+", (s or "").lower()) if t]
+
+
+def _flat(s):
+    """Accent-folded, punctuation-free lowercase form (for slug comparison)."""
+    s = unicodedata.normalize("NFKD", (s or "").lower())
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]", "", s)
+
+
+def surname_ok(title, name, slug=None):
+    """Does this candidate carry evidence of the person's surname?
+
+    The surname is the discriminator: a title that merely contains the *given*
+    name is a different person (`Adem Betta` must not match `ALLEN ADEM`).
+
+    Three kinds of evidence count:
+      - the surname as a title token, accent-folded (`radim vysoký` ~ `Vysoky`)
+      - a hyphenated surname whole or part by part (`Anisa Anorve-Gomez` ->
+        `Anissa Gomez`; `Tosin Ade-Ajayi` keeps its hyphen)
+      - the surname inside the profile *slug*, which is name-derived and
+        survives an abbreviated title (`Nour H.` for `/in/nourhassoun`)
+
+    Near-variants are only allowed on long tokens, and slug evidence only on
+    surnames of 5+ characters. Fuzzy-matching short surnames re-admits exactly
+    the near-miss class the skill warns about: `Seth Tam` -> `Seth Tams`
+    scores 0.857, so a bare 0.85 ratio keeps a different person.
+    """
+    nt = [t for t in ordered_tokens(name) if len(t) > 1]
+    if not nt:
+        return False
+    surname = nt[-1]
+    probes = [surname] + [p for p in surname.split("-") if len(p) > 1]
+    have = ordered_tokens(title)
+    for p in probes:
+        fp = _flat(p)
+        for h in have:
+            if p == h or fp == _flat(h):
+                return True
+            if len(p) >= 6 and len(h) >= 6 and difflib.SequenceMatcher(None, p, h).ratio() >= 0.85:
+                return True
+    if slug:
+        fs = _flat(slug)
+        for p in probes:
+            if len(_flat(p)) >= 5 and _flat(p) in fs:
+                return True
+    return False
+
+
+def strict_identity(rows, store):
+    """Blank the URL on rows whose matched profile shows no surname evidence.
+
+    Returns the names that were blanked. Rows that keep their URL but fail the
+    full-name check stay flagged for review - those are usually nicknames.
+    """
+    blanked = []
+    for r in rows:
+        if not r["url"]:
+            continue
+        slug = r["url"].rsplit("/", 1)[-1]
+        titles = [h.get("title") or "" for h in store.get(r["name"], [])
+                  if re.search(r"linkedin\.com/in/" + re.escape(slug), h.get("url") or "")]
+        if titles and not any(surname_ok(t, r["name"], slug) for t in titles):
+            blanked.append(r["name"])
+            r.update(url=None, loc=None, flag="Unknown", conf="Low",
+                             note=f"No LinkedIn match - nearest hit was a different person "
+                                  f"({titles[0][:40]})", headline="")
+    return blanked
+
+
 def build_rows(store):
     rows = []
     for name in sorted(store, key=str.lower):
@@ -304,9 +420,12 @@ def build_rows(store):
             blob = (h.get("title") or "") + " \n " + (h.get("desc") or "")
             name_hit = any(f in norm(blob) for f in forms)
             c = cands.setdefault(slug, {"slug": slug, "profile": False, "name_hit": False,
-                                        "locs": [], "flags": []})
+                                        "title_hit": False, "locs": [], "flags": []})
             c["profile"] = c["profile"] or is_profile
             c["name_hit"] = c["name_hit"] or name_hit
+            c["title_hit"] = c["title_hit"] or title_matches(h.get("title") or "", name)
+            if not c.get("title") and (h.get("title") or ""):
+                c["title"] = h["title"]
             for l in locs_in(blob):
                 if l not in c["locs"]:
                     c["locs"].append(l)
@@ -317,13 +436,15 @@ def build_rows(store):
                 continue
             flag = sorted(c["flags"], key=lambda f: ORDER[f])[0] if c["flags"] else "Unknown"
             loc = next((l for l, f in zip(c["locs"], c["flags"]) if f == flag), None)
-            score = (5 if c["name_hit"] else 0) + 3 + (2 if c["locs"] else 0)
+            score = ((5 if c["name_hit"] else 0) + (4 if c["title_hit"] else 0)
+                     + 3 + (2 if c["locs"] else 0))
             ranked.append({**c, "flag": flag, "loc": loc, "score": score})
         ranked.sort(key=lambda c: (-c["score"], ORDER[c["flag"]]))
         n = len(ranked)
         if not ranked:
             rows.append({"name": name, "url": None, "loc": None, "flag": "Unknown",
-                         "conf": "Low", "note": "No LinkedIn profile surfaced", "n": 0})
+                                 "conf": "Low", "note": "No LinkedIn profile surfaced", "n": 0,
+                                 "headline": ""})
             continue
         best = ranked[0]
         if best["flag"] == "Yes":
@@ -335,9 +456,15 @@ def build_rows(store):
         note = f"{n} candidate{'s' if n != 1 else ''}"
         if best["loc"]:
             note += f"; {best['loc']}"
+        if not best["title_hit"]:
+            # The provenance audit passes this row happily - the slug really did
+            # come from a literal /in/ hit. Only the identity check notices that
+            # the matched profile's own title does not carry this person's name.
+            conf = "Low"
+            note = "NAME CHECK: matched profile title lacks this name | " + note
         rows.append({"name": name, "url": f"https://linkedin.com/in/{best['slug']}",
                      "loc": best["loc"], "flag": best["flag"], "conf": conf,
-                     "note": note, "n": n})
+                     "note": note, "n": n, "headline": best.get("title") or ""})
     return rows
 
 
@@ -567,6 +694,201 @@ def append_to_master(rows, tab_name):
             f"#gid={new_sheet_id}")
 
 
+def parse_sheet_id(s):
+    m = re.search(r"/spreadsheets/d/([A-Za-z0-9_-]+)", s or "")
+    return m.group(1) if m else (s or "").strip()
+
+
+def append_consolidated(spreadsheet_id, rows, ev, eid, tab_name):
+    """Append enriched rows into a user-specified sheet, consolidated schema.
+
+    One shared tab holds every event's rows:
+        Event Name | Event URL | Guest Name | LinkedIn Profile |
+        Company/Headline | Timestamp
+    The tab is created on first use (with a header); later events append
+    beneath it. This is the schema the batch GUI targets (event-agnostic,
+    timestamped rows) - distinct from the legacy master-tab shape
+    (Name, LinkedIn, Location, LA Area?, Confidence, Notes).
+    Returns the URL of the tab, with #gid.
+    """
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+
+    token = os.path.join(HERMES, "google_token.json")
+    if not os.path.isfile(token):
+        die(f"not authenticated with Google (no {token}). "
+            "Run the google-workspace setup first.")
+    creds = Credentials.from_authorized_user_file(token)
+    sh = build("sheets", "v4", credentials=creds)
+
+    tab = (tab_name or "Event")[:100].strip() or "Event"
+    meta = sh.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    gid = None
+    for s in meta["sheets"]:
+        if s["properties"]["title"] == tab:
+            gid = s["properties"]["sheetId"]
+            break
+    if gid is None:
+        resp = sh.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": [{"addSheet": {"properties": {"title": tab}}}]}).execute()
+        gid = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
+        sh.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id, range=f"'{tab}'!A1",
+            valueInputOption="RAW",
+            body={"values": [["Event Name", "Event URL", "Guest Name",
+                              "LinkedIn Profile", "Company/Headline", "Timestamp"]]}).execute()
+
+    stamp = datetime.now().isoformat(timespec="seconds")
+    vals = [[ev.get("title") or eid, f"https://partiful.com/e/{eid}",
+             r["name"], r.get("url") or "", r.get("headline") or "", stamp]
+            for r in rows]
+    if vals:
+        sh.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id, range=f"'{tab}'!A:F",
+            valueInputOption="RAW", body={"values": vals}).execute()
+    return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}#gid={gid}"
+
+
+def run_pipeline(a):
+    """One event, end to end. `a` is an argparse Namespace (see main()).
+
+    Raises PipelineError on failure instead of exiting, so a GUI, cron job or
+    test can catch it. Returns a dict with the rows, drops and any sheet URLs.
+    Live output goes to stdout AND to LOG (if set); enrichment ticks go to
+    PROGRESS(done, total) if set.
+    """
+    if not os.path.isfile(AUTH):
+        die(f"auth file not found: {AUTH}")
+    cfg = json.load(open(AUTH, encoding="utf-8"))
+    access, uid = refresh_access(cfg)
+
+    m = re.search(r"/e/([A-Za-z0-9]+)", a.event)
+    eid = m.group(1) if m else a.event.strip()
+
+    info = api("getEventInfo", {"eventId": eid}, access, uid)
+    ev = info.get("event", {})
+    guests = api("getGuests", {"eventId": eid}, access, uid)
+    log(f"{ev.get('title')}\n  event: {eid}")
+
+    names = [(g.get("user") or {}).get("name") or g.get("name") for g in guests]
+    masked = sum(1 for n in names if n and (MASKED.match(n) or re.search(r"\bx{3,}\b", n)))
+    if masked:
+        die(f"{masked}/{len(names)} names are MASKED - auth is not effective.")
+
+    # Always persist the raw pull: it is the only stable record of guest ids, and
+    # a later union across pulls is impossible without it. Callers can override
+    # the location, but there is no way to end up with none.
+    raw_path = a.raw_out or os.path.join(HERMES, f"partiful-raw-{eid}.json")
+    json.dump({"result": {"data": guests}}, open(raw_path, "w", encoding="utf-8"))
+    log(f"  raw pull: {raw_path}")
+    if a.union_raw and os.path.isfile(a.union_raw):
+        prev = json.load(open(a.union_raw, encoding="utf-8"))["result"]["data"]
+        seen = {g["id"] for g in guests}
+        added = [g for g in prev if g["id"] not in seen]
+        guests = guests + added
+        log(f"  union: +{len(added)} records from {os.path.basename(a.union_raw)}")
+
+    if a.statuses:
+        keep = {s.strip().upper() for s in a.statuses.split(",")}
+        present = Counter((g.get("status") or "").upper() for g in guests)
+        kept = [g for g in guests if (g.get("status") or "").upper() in keep]
+        if not kept:
+            # Filtering to a status the event does not use (e.g. --statuses GOING
+            # on an approval-gated event where everyone is APPROVED) would
+            # otherwise write an empty workbook and look like a quiet success.
+            die(f"--statuses {sorted(keep)} matched 0 of {len(guests)} guests. "
+                f"Statuses present: {dict(present)}. Drop --statuses or use one of "
+                f"those values.")
+        if len(kept) < len(guests):
+            log(f"  status filter {sorted(keep)}: {len(guests)} -> {len(kept)} "
+                  f"(present: {dict(present)})")
+        guests = kept
+
+    passing, dropped = classify(guests)
+    log(f"  returned: {len(guests)}"
+          + ("  <-- exactly 500, likely a CAP" if len(guests) == 500 else ""))
+    log(f"  passed:   {len(passing)}   dropped: {len(dropped)}")
+
+    extra = []
+    if len(guests) == 500:
+        extra.append(("Caveat", "getGuests returned exactly 500 and ignores all pagination "
+                                "params; this is a shifting sample, not the full list."))
+
+    if a.no_enrich:
+        rows = [{"name": p["name"], "url": None, "loc": None, "flag": "Unknown",
+                 "conf": "Low", "note": "", "n": 0} for p in passing]
+        write_workbook(rows, dropped, ev, eid, a.out, extra)
+        log("wrote:", a.out)
+        res = {"rows": rows, "dropped": dropped, "ev": ev, "eid": eid,
+               "store": {}, "raw_path": raw_path, "blanked": [], "flagged": [],
+               "sheet_url": None, "master_url": None, "target_url": None, "out": a.out}
+        if a.upload:
+            res["sheet_url"] = upload_to_sheets(a.out, a.sheet_title)
+            log("sheet:", res["sheet_url"])
+        if a.append_master:
+            tab = re.sub(r"[^A-Za-z0-9 _-]+", "", ev.get("title") or eid)[:80].strip() or "Event"
+            res["master_url"] = append_to_master(rows, tab)
+            log("master:", res["master_url"])
+        if a.append_sheet:
+            res["target_url"] = append_consolidated(
+                parse_sheet_id(a.append_sheet), rows, ev, eid,
+                a.append_tab or (re.sub(r"[^A-Za-z0-9 _-]+", "",
+                                        ev.get("title") or eid)[:80].strip() or "Event"))
+            log("target sheet:", res["target_url"])
+        return res
+
+    key = load_exa_key()
+    nm = [p["name"] for p in passing]
+    log(f"  enriching {len(nm)} names via Exa ({a.workers} workers)...")
+    store, secs = enrich(key, nm, a.workers, a.city, on_progress=PROGRESS)
+    log(f"  enrichment done in {secs:.0f}s")
+    if a.hits_out:
+        json.dump(store, open(a.hits_out, "w", encoding="utf-8"))
+        log(f"  hits: {a.hits_out}")
+
+    rows = build_rows(store)
+    bad = audit(rows, store)
+    if bad:
+        die(f"AUDIT FAILED: {len(bad)} URL(s) not backed by a literal /in/ hit: {bad[:5]}")
+    log(f"  audit: 0 fabricated URLs across {sum(1 for r in rows if r['url'])} URL cells")
+    if a.strict_identity:
+        blanked = strict_identity(rows, store)
+        if blanked:
+            log(f"  strict identity: blanked {len(blanked)} URL(s) with no surname "
+                  f"evidence: {blanked}")
+    flagged = [r for r in rows if r["url"] and r["note"].startswith("NAME CHECK:")]
+    log(f"  identity audit: {len(flagged)}/{sum(1 for r in rows if r['url'])} URL rows "
+          f"flagged (profile title lacks the name) - review, do not ship blind")
+    for r in flagged:
+        log(f"    ~ {r['name']} -> {r['url']}")
+
+    write_workbook(rows, dropped, ev, eid, a.out, extra)
+    conf = Counter(r["conf"] for r in rows)
+    log(f"  LA=Yes:   {sum(1 for r in rows if r['flag'] == 'Yes')}")
+    log(f"  with URL: {sum(1 for r in rows if r['url'])}")
+    log(f"  conf:     {conf['High']} High / {conf['Medium']} Medium / {conf['Low']} Low")
+    log("wrote:", a.out)
+    res = {"rows": rows, "dropped": dropped, "ev": ev, "eid": eid,
+           "store": store, "raw_path": raw_path, "blanked": blanked,
+           "flagged": flagged, "sheet_url": None, "master_url": None,
+           "target_url": None, "out": a.out}
+    if a.upload:
+        res["sheet_url"] = upload_to_sheets(a.out, a.sheet_title)
+        log("sheet:", res["sheet_url"])
+    if a.append_master:
+        tab = re.sub(r"[^A-Za-z0-9 _-]+", "", ev.get("title") or eid)[:80].strip() or "Event"
+        res["master_url"] = append_to_master(rows, tab)
+        log("master:", res["master_url"])
+    if a.append_sheet:
+        res["target_url"] = append_consolidated(
+            parse_sheet_id(a.append_sheet), rows, ev, eid,
+            a.append_tab or (re.sub(r"[^A-Za-z0-9 _-]+", "",
+                                    ev.get("title") or eid)[:80].strip() or "Event"))
+        log("target sheet:", res["target_url"])
+    return res
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--event", required=True, help="Partiful event URL or ID")
@@ -584,100 +906,17 @@ def main():
     ap.add_argument("--no-enrich", action="store_true", help="names only, skip LinkedIn")
     ap.add_argument("--append-master", action="store_true",
                     help="add a tab to the Oxen-Forecast master Google Sheet")
+    ap.add_argument("--append-sheet", default=None,
+                    help="append rows into a user-specified Google Sheet (URL or ID); "
+                         "creates/uses ONE consolidated tab (see --append-tab)")
+    ap.add_argument("--append-tab", default=None,
+                    help="tab name for --append-sheet (default: the event title)")
+    ap.add_argument("--strict-identity", action="store_true",
+                    help="blank URLs whose matched profile shows no surname evidence")
+    ap.add_argument("--hits-out", default=None,
+                    help="save the raw Exa hit store here so the audits can be re-run offline")
     a = ap.parse_args()
-
-    if not os.path.isfile(AUTH):
-        die(f"auth file not found: {AUTH}")
-    cfg = json.load(open(AUTH, encoding="utf-8"))
-    access, uid = refresh_access(cfg)
-
-    m = re.search(r"/e/([A-Za-z0-9]+)", a.event)
-    eid = m.group(1) if m else a.event.strip()
-
-    info = api("getEventInfo", {"eventId": eid}, access, uid)
-    ev = info.get("event", {})
-    guests = api("getGuests", {"eventId": eid}, access, uid)
-    print(f"{ev.get('title')}\n  event: {eid}")
-
-    names = [(g.get("user") or {}).get("name") or g.get("name") for g in guests]
-    masked = sum(1 for n in names if n and (MASKED.match(n) or re.search(r"\bx{3,}\b", n)))
-    if masked:
-        die(f"{masked}/{len(names)} names are MASKED - auth is not effective.")
-
-    # Always persist the raw pull: it is the only stable record of guest ids, and
-    # a later union across pulls is impossible without it. Callers can override
-    # the location, but there is no way to end up with none.
-    raw_path = a.raw_out or os.path.join(HERMES, f"partiful-raw-{eid}.json")
-    json.dump({"result": {"data": guests}}, open(raw_path, "w", encoding="utf-8"))
-    print(f"  raw pull: {raw_path}")
-    if a.union_raw and os.path.isfile(a.union_raw):
-        prev = json.load(open(a.union_raw, encoding="utf-8"))["result"]["data"]
-        seen = {g["id"] for g in guests}
-        added = [g for g in prev if g["id"] not in seen]
-        guests = guests + added
-        print(f"  union: +{len(added)} records from {os.path.basename(a.union_raw)}")
-
-    if a.statuses:
-        keep = {s.strip().upper() for s in a.statuses.split(",")}
-        present = Counter((g.get("status") or "").upper() for g in guests)
-        kept = [g for g in guests if (g.get("status") or "").upper() in keep]
-        if not kept:
-            # Filtering to a status the event does not use (e.g. --statuses GOING
-            # on an approval-gated event where everyone is APPROVED) would
-            # otherwise write an empty workbook and look like a quiet success.
-            die(f"--statuses {sorted(keep)} matched 0 of {len(guests)} guests. "
-                f"Statuses present: {dict(present)}. Drop --statuses or use one of "
-                f"those values.")
-        if len(kept) < len(guests):
-            print(f"  status filter {sorted(keep)}: {len(guests)} -> {len(kept)} "
-                  f"(present: {dict(present)})")
-        guests = kept
-
-    passing, dropped = classify(guests)
-    print(f"  returned: {len(guests)}"
-          + ("  <-- exactly 500, likely a CAP" if len(guests) == 500 else ""))
-    print(f"  passed:   {len(passing)}   dropped: {len(dropped)}")
-
-    extra = []
-    if len(guests) == 500:
-        extra.append(("Caveat", "getGuests returned exactly 500 and ignores all pagination "
-                                "params; this is a shifting sample, not the full list."))
-
-    if a.no_enrich:
-        rows = [{"name": p["name"], "url": None, "loc": None, "flag": "Unknown",
-                 "conf": "Low", "note": "", "n": 0} for p in passing]
-        write_workbook(rows, dropped, ev, eid, a.out, extra)
-        print("wrote:", a.out)
-        if a.upload:
-            print("sheet:", upload_to_sheets(a.out, a.sheet_title))
-        if a.append_master:
-            tab = re.sub(r"[^A-Za-z0-9 _-]+", "", ev.get("title") or eid)[:80].strip() or "Event"
-            print("master:", append_to_master(rows, tab))
-        return
-
-    key = load_exa_key()
-    nm = [p["name"] for p in passing]
-    print(f"  enriching {len(nm)} names via Exa ({a.workers} workers)...")
-    store, secs = enrich(key, nm, a.workers, a.city)
-    print(f"  enrichment done in {secs:.0f}s")
-
-    rows = build_rows(store)
-    bad = audit(rows, store)
-    if bad:
-        die(f"AUDIT FAILED: {len(bad)} URL(s) not backed by a literal /in/ hit: {bad[:5]}")
-    print(f"  audit: 0 fabricated URLs across {sum(1 for r in rows if r['url'])} URL cells")
-
-    write_workbook(rows, dropped, ev, eid, a.out, extra)
-    conf = Counter(r["conf"] for r in rows)
-    print(f"  LA=Yes:   {sum(1 for r in rows if r['flag'] == 'Yes')}")
-    print(f"  with URL: {sum(1 for r in rows if r['url'])}")
-    print(f"  conf:     {conf['High']} High / {conf['Medium']} Medium / {conf['Low']} Low")
-    print("wrote:", a.out)
-    if a.upload:
-        print("sheet:", upload_to_sheets(a.out, a.sheet_title))
-    if a.append_master:
-        tab = re.sub(r"[^A-Za-z0-9 _-]+", "", ev.get("title") or eid)[:80].strip() or "Event"
-        print("master:", append_to_master(rows, tab))
+    run_pipeline(a)
 
 
 if __name__ == "__main__":
