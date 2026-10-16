@@ -612,10 +612,11 @@ def upload_to_sheets(xlsx_path, title=None):
     return f"https://docs.google.com/spreadsheets/d/{sid}"
 
 
-def append_to_master(rows, tab_name):
-    """Add a new tab to the Oxen-Forecast master sheet with enriched rows.
+def append_to_master(rows, tab_name, spreadsheet_id=MASTER_ID):
+    """Add a new tab to a spreadsheet with enriched rows (per-event tab).
 
-    If the tab name already exists, retries with " (2)", " (3)", ... suffixes.
+    Defaults to the Oxen-Forecast master sheet. If the tab name already
+    exists, retries with " (2)", " (3)", ... suffixes.
     Returns the URL to the new tab.
     """
     from google.oauth2.credentials import Credentials
@@ -636,7 +637,7 @@ def append_to_master(rows, tab_name):
     while True:
         try:
             resp = sh.spreadsheets().batchUpdate(
-                spreadsheetId=MASTER_ID,
+                spreadsheetId=spreadsheet_id,
                 body={"requests": [{"addSheet": {
                     "properties": {"title": tab_name}}}]}
             ).execute()
@@ -661,7 +662,7 @@ def append_to_master(rows, tab_name):
 
     if sheet_rows:
         sh.spreadsheets().values().update(
-            spreadsheetId=MASTER_ID,
+        spreadsheetId=spreadsheet_id,
             range=f"'{tab_name}'!A1",
             valueInputOption="RAW",
             body={"values": sheet_rows}).execute()
@@ -689,8 +690,8 @@ def append_to_master(rows, tab_name):
                       "endRowIndex": nrows,
                       "startColumnIndex": 0, "endColumnIndex": ncols}}}})
     sh.spreadsheets().batchUpdate(
-        spreadsheetId=MASTER_ID, body={"requests": style_reqs}).execute()
-    return (f"https://docs.google.com/spreadsheets/d/{MASTER_ID}"
+        spreadsheetId=spreadsheet_id, body={"requests": style_reqs}).execute()
+    return (f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
             f"#gid={new_sheet_id}")
 
 
@@ -850,7 +851,8 @@ def run_pipeline(a):
             log("sheet:", res["sheet_url"])
         if a.append_master:
             tab = re.sub(r"[^A-Za-z0-9 _-]+", "", ev.get("title") or eid)[:80].strip() or "Event"
-            res["master_url"] = append_to_master(rows, tab)
+            res["master_url"] = append_to_master(
+                rows, tab, parse_sheet_id(a.append_master_sheet) if a.append_master_sheet else MASTER_ID)
             log("master:", res["master_url"])
         if a.append_sheet:
             res["target_url"] = append_consolidated(
@@ -900,7 +902,8 @@ def run_pipeline(a):
         log("sheet:", res["sheet_url"])
     if a.append_master:
         tab = re.sub(r"[^A-Za-z0-9 _-]+", "", ev.get("title") or eid)[:80].strip() or "Event"
-        res["master_url"] = append_to_master(rows, tab)
+        res["master_url"] = append_to_master(
+            rows, tab, parse_sheet_id(a.append_master_sheet) if a.append_master_sheet else MASTER_ID)
         log("master:", res["master_url"])
     if a.append_sheet:
         res["target_url"] = append_consolidated(
@@ -928,6 +931,9 @@ def main():
     ap.add_argument("--no-enrich", action="store_true", help="names only, skip LinkedIn")
     ap.add_argument("--append-master", action="store_true",
                     help="add a tab to the Oxen-Forecast master Google Sheet")
+    ap.add_argument("--append-master-sheet", default=None,
+                    help="with --append-master: target a different sheet (URL or ID) "
+                         "instead of the Oxen-Forecast master")
     ap.add_argument("--append-sheet", default=None,
                     help="append rows into a user-specified Google Sheet (URL or ID); "
                          "creates/uses ONE consolidated tab (see --append-tab)")
