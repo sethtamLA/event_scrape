@@ -740,10 +740,32 @@ def append_consolidated(spreadsheet_id, rows, ev, eid, tab_name):
                               "LinkedIn Profile", "Company/Headline", "Timestamp"]]}).execute()
 
     stamp = datetime.now().isoformat(timespec="seconds")
-    vals = [[ev.get("title") or eid, f"https://partiful.com/e/{eid}",
+    ev_url = f"https://partiful.com/e/{eid}"
+    vals = [[ev.get("title") or eid, ev_url,
              r["name"], r.get("url") or "", r.get("headline") or "", stamp]
             for r in rows]
     if vals:
+        # Dedupe against rows already in the tab: skip a guest who is already
+        # present for THIS event. Keyed on (event URL, normalized guest name)
+        # so the same person at a different event still gets added. This makes
+        # re-runs idempotent - same as partiful_incremental.py's name matching.
+        try:
+            existing = sh.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id, range=f"'{tab}'!A:C").execute()
+            seen = set()
+            for row in existing.get("values", [])[1:]:  # skip header
+                if len(row) >= 3 and row[0]:
+                    seen.add((row[1].strip(), norm(row[2])))
+        except Exception:
+            seen = set()  # if reading fails, append everything rather than lose data
+        before = len(vals)
+        vals = [v for v in vals if (v[1].strip(), norm(v[2])) not in seen]
+        if not vals:
+            log(f"  {tab!r}: all {before} guests already present - nothing appended")
+            return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}#gid={gid}"
+        if len(vals) < before:
+            log(f"  {tab!r}: {before - len(vals)} of {before} guests already "
+                f"present - appending {len(vals)} new")
         sh.spreadsheets().values().append(
             spreadsheetId=spreadsheet_id, range=f"'{tab}'!A:F",
             valueInputOption="RAW", body={"values": vals}).execute()
