@@ -91,6 +91,14 @@ Consequence: when the masked guard fires, the fix is for the user to RSVP to
 that event (or be invited) — not to re-harvest the token. Check that first
 before spending a cycle on Chrome's leveldb.
 
+**RSVP is necessary but not sufficient on approval-gated events.** An RSVP
+with status `PENDING_APPROVAL` keeps names masked until the host approves —
+observed with 321/335 names masked while the user's own record sat
+`PENDING_APPROVAL` beside 334 `APPROVED` guests. Diagnose by matching the
+token uid against the guest records (`getGuests` includes your own row): if
+your status is PENDING_APPROVAL, the fix is host approval or an invitation,
+not a token re-harvest and not another re-run.
+
 ## Auth: the Firebase token
 
 Partiful auth is Firebase (phone + SMS OTP). The tokens live in **IndexedDB**
@@ -312,9 +320,65 @@ and returns its `#gid` URL as `target_url`. **It dedupes**: rows already in the
 tab for that event (keyed on event URL + normalized guest name) are skipped,
 so re-runs are idempotent (like `partiful_incremental.py`); the same person at
 a *different* event is still added. If reading the existing rows fails, it
-appends everything rather than risk losing data.  `--append-master` is unchanged.
+appends everything rather than risk losing data.  `--append-master` is unchanged;
+`--append-master-sheet <url-or-id>` makes `--append-master` target any sheet
+instead of the Oxen-Forecast master (the GUI's per-event tab path).
 The `enrich()` thread-pool bug (only the first name was enriched, early return
 inside the loop) is fixed.
+
+### The Streamlit batch GUI (where the embedding API is consumed)
+
+The user drives batches from a local Streamlit app at
+`C:\Users\Seth\partiful-gui` (run `run.bat`, or `streamlit run app.py`; its
+venv already has streamlit + google libs + openpyxl — don't reinstall into the
+system python). It pastes up to 10 event URLs, a target sheet (URL, ID, or
+`PARTIFUL_SHEET_ID` env), hits Start, and the worker thread calls
+`run_pipeline()` per event with `append_master=True, append_master_sheet=<id>`
+→ **one tab per event** (Oxen-Forecast style: Name | LinkedIn Profile |
+Location | LA Area? | Confidence | Notes). The user chose per-event tabs over
+the consolidated single-tab schema — do not flip it back. Architecture rules:
+
+- **`st.session_state` is thread-bound — never read it in a worker thread.**
+  A background thread gets a DIFFERENT session proxy than the main script
+  thread, so `st.session_state["job"]` inside the thread raises KeyError and
+  the worker dies silently (the exception lands on thread stderr, the UI just
+  never updates). Pass the mutable state object (a `JobState` dataclass) into
+  the thread  as an argument; the main thread alone touches session_state.
+- **A background thread mutating a plain object does NOT re-render Streamlit.**
+  The log box stays frozen at the last script run, so a run that failed 5s in
+  looks like a silent hang for the whole session — the recurring "I started
+  it and nothing happened" report. Wrap the live view in `@st.fragment(run_every=2)`
+  (Streamlit ≥1.32) so progress lines and `FAIL ...` lines actually appear;
+  without it you cannot distinguish a dead worker from an enriching one.
+- **Verify the app headlessly with `streamlit.testing.v1.AppTest`** — no
+  browser needed: `at = AppTest.from_file("app.py")`, `at.run()`,
+  `at.text_area[0].set_value(...)`, `at.button[0].click().run()`, then read
+  `at.exception`, `at.markdown`, or `at.session_state`. This is the fastest
+  way to reproduce what a user's click did and to prove the widget tree
+  renders. It bypasses browser-profile locks entirely.
+- **Normalize pasted URLs tolerantly.** A strict anchor regex rejects real
+  pasted links — trailing spaces, share-link `?utm_...`/`#` fragments, missing
+  `https://` — and the user sees only "fix these inputs". Trim, strip `<>`,
+  cut at `#`/`?`, allow a bare `partiful.com/e/<id>`, and canonicalize to
+  `https://partiful.com/e/<id>` before validating.
+- **Throttle progress→log.** Wiring `PROGRESS` straight to the log floods it;
+  log every ~5 ticks (`searched 5/92 names...`) so the console visibly moves
+  without spam, and keep the progress bar ticking per name.
+- **Monitoring a run by file mtimes: keep a seen-set.** A fixed `since`
+  timestamp re-reports the same file every poll tick (used to spam 15
+  identical NEW PULL/NEW XLSX lines for one run). Track reported paths in a
+  set and only report paths not yet seen; report sheet growth once.
+- **`partiful-auth.json` mtime is a false start signal.** Token refresh
+  rewrites it as the FIRST pipeline step, so a fresh mtime proves only that the
+  worker began — not that scraping happened. The raw pull
+  `partiful-raw-<id>.json` is the first artifact that proves `getGuests` ran;
+  a refreshed token with no fresh raw pull means the pipeline died between
+  refresh and the API call, or the masked-name guard is about to fire. Check
+  the raw pull before concluding a run is progressing.
+- **Cleanup drill rows from a sheet by content match, not row numbers.** Row
+  indices shift after appends, so fixed-index clears hit the wrong cells.
+  Read the tab back, match the exact offending values, and `deleteDimension`
+  (delete bottom-up so earlier indices stay valid).
 
 **Manual path**, if the pipeline breaks — `partiful_guests.py` for the scrape,
 then `contact-list-enrichment`'s `build_guest_workbook.py` for the workbook:
