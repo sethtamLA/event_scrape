@@ -308,7 +308,11 @@ user-specified Google Sheet as ONE consolidated tab (schema:
 Event Name | Event URL | Guest Name | LinkedIn Profile | Company/Headline |
 Timestamp; tab created on first use, created via `--append-tab`, default the
 event title) — distinct from `--append-master` (Oxen-Forecast tab per event) —
-and returns its `#gid` URL as `target_url`. `--append-master` is unchanged.
+and returns its `#gid` URL as `target_url`. **It dedupes**: rows already in the
+tab for that event (keyed on event URL + normalized guest name) are skipped,
+so re-runs are idempotent (like `partiful_incremental.py`); the same person at
+a *different* event is still added. If reading the existing rows fails, it
+appends everything rather than risk losing data.  `--append-master` is unchanged.
 The `enrich()` thread-pool bug (only the first name was enriched, early return
 inside the loop) is fixed.
 
